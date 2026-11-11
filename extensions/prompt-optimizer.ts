@@ -31,8 +31,6 @@ Rules:
 const MAX_TOKENS = 4096;
 const CONTEXT_TURNS = 3;
 const FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-/** Body height cap; only the tail of the streamed text is shown. */
-const BODY_LINES = 14;
 
 // ---------------------------------------------------------------------------
 // Conversation context (last N turns)
@@ -237,7 +235,10 @@ class OptimizerView implements Component {
   }
 
   render(width: number): string[] {
+    // `width` is already the paint area the host reserved for this component;
+    // `rows` bounds how many lines can be shown before the view is clipped.
     const w = Math.max(20, width);
+    const rows = process.stdout.rows ?? 40;
     const spinner = FRAMES[this.#frame];
     const head =
       this.#phase === "streaming"
@@ -252,15 +253,26 @@ class OptimizerView implements Component {
           ? `${this.#message} — Enter / Esc 关闭`
           : "Enter 接受 · r 再生成 · e 编辑 · Esc 回退原文";
 
-    const body =
+    // Wrap to the full width and do not add our own indent: the host already
+    // pads the component, and any extra column pushes the last glyph off.
+    const wrapped =
       this.#phase === "streaming" && !this.#text
         ? ["（等待模型输出…）"]
-        : wrapTextWithAnsi(this.#text, Math.max(10, w - 2)).map((line) => ` ${line}`);
+        : wrapTextWithAnsi(this.#text, w);
+
+    // Reserve room for the header, both rules, the footer, and a chrome row.
+    const chrome = this.#phase === "streaming" || this.#phase === "error" ? 5 : 4;
+    const capacity = Math.max(3, rows - chrome);
+    const truncated = wrapped.length > capacity;
+    const body = truncated ? wrapped.slice(-capacity) : wrapped;
+
+    const omitted = truncated ? [`… 上方 ${wrapped.length - capacity} 行未显示`] : [];
+    const shown = omitted.length ? body.slice(0, Math.max(1, capacity - omitted.length)) : body;
 
     return [
       truncateToWidth(head, w),
       "─".repeat(w),
-      ...body.slice(-BODY_LINES),
+      ...(omitted.length ? [...omitted, ...shown] : shown),
       "─".repeat(w),
       truncateToWidth(footer, w),
     ];
