@@ -263,16 +263,15 @@ class OptimizerView implements Component {
     // Reserve room for the header, both rules, the footer, and a chrome row.
     const chrome = this.#phase === "streaming" || this.#phase === "error" ? 5 : 4;
     const capacity = Math.max(3, rows - chrome);
-    const truncated = wrapped.length > capacity;
-    const body = truncated ? wrapped.slice(-capacity) : wrapped;
-
-    const omitted = truncated ? [`… 上方 ${wrapped.length - capacity} 行未显示`] : [];
-    const shown = omitted.length ? body.slice(0, Math.max(1, capacity - omitted.length)) : body;
+    // When clipped, the notice takes one row and the newest lines fill the rest.
+    const shown = wrapped.length > capacity ? wrapped.slice(-(capacity - 1)) : wrapped;
+    const body =
+      shown.length < wrapped.length ? [`… 上方 ${wrapped.length - shown.length} 行未显示`, ...shown] : shown;
 
     return [
       truncateToWidth(head, w),
       "─".repeat(w),
-      ...(omitted.length ? [...omitted, ...shown] : shown),
+      ...body,
       "─".repeat(w),
       truncateToWidth(footer, w),
     ];
