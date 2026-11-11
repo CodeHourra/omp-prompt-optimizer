@@ -376,7 +376,12 @@ export default function promptOptimizer(pi: ExtensionAPI): void {
       return view;
     });
 
-    if (outcome === undefined) return;
+    // Every non-accept exit puts the draft back: `/optimize <text>` clears the
+    // editor before we run, so leaving without a write would lose the prompt.
+    if (outcome === undefined) {
+      ctx.ui.setEditorText?.(original);
+      return;
+    }
     ctx.ui.setEditorText?.(outcome.text);
     if (outcome.kind === "edit") ctx.ui.notify("已写入输入框，可编辑后发送", "info");
   };
