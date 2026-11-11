@@ -1,20 +1,20 @@
 // prompt-optimizer extension for OMP (Oh My Pi).
 //
-// /optimize — optimize the current editor draft with an LLM. The result streams
-// into a read-only preview widget above the input box, so the draft is never
-// overwritten while generating. When generation ends a native dialog offers
-// accept / regenerate / edit / keep the original.
+// /optimize — rewrite the current editor draft with an LLM in a full-screen
+// custom view. The draft is never touched until you accept the result.
 //
 // Design contract:
 //   - Trigger: /optimize slash command, or Option+O in the editor.
 //   - Optimizer model: @smol role via ctx.models.resolve (zero plugin config).
 //   - Context: last 3 conversation turns appended to the optimization request.
-//   - Preview: last lines of the streamed text in a widget; editor keeps the draft.
-//   - Esc: aborts the request; the draft is untouched.
-//   - Result: never auto-sent, only written to the editor on accept / edit.
+//   - Keys while streaming: Esc / Ctrl+C aborts the request.
+//   - Keys when done: Enter accept, r regenerate, e edit, Esc keep original.
+//   - Result: written to the editor only on accept / edit; never auto-sent.
 //   - State: in-memory only. No history, no persistence.
 //   - Fail fast: empty editor / no model / no auth / busy -> notify and exit.
 
+import type { Component } from "@oh-my-pi/pi-tui";
+import { matchesKey, truncateToWidth, wrapTextWithAnsi } from "@oh-my-pi/pi-tui";
 import { streamSimple } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
@@ -30,10 +30,9 @@ Rules:
 
 const MAX_TOKENS = 4096;
 const CONTEXT_TURNS = 3;
-const WIDGET = "prompt-optimizer";
 const FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-/** Widget height cap: only the tail of the streamed text is shown. */
-const PREVIEW_LINES = 12;
+/** Body height cap; only the tail of the streamed text is shown. */
+const BODY_LINES = 14;
 
 // ---------------------------------------------------------------------------
 // Conversation context (last N turns)
@@ -139,6 +138,146 @@ async function generate(
 }
 
 // ---------------------------------------------------------------------------
+// Custom view
+// ---------------------------------------------------------------------------
+
+/** Resolution of the view: writing back needs both the text and the intent. */
+type Outcome = { kind: "accept" | "edit"; text: string } | undefined;
+
+interface ViewDeps {
+  label: string;
+  requestRender: () => void;
+  done: (outcome: Outcome) => void;
+  run: (onText: (text: string) => void, signal: AbortSignal) => Promise<string>;
+}
+
+class OptimizerView implements Component {
+  #deps: ViewDeps;
+  #phase: "streaming" | "done" | "error" = "streaming";
+  #text = "";
+  #message = "";
+  #frame = 0;
+  #controller: AbortController | null = null;
+  #disposed = false;
+
+  constructor(deps: ViewDeps) {
+    this.#deps = deps;
+  }
+
+  /** Kick off the first generation. Call after the view is mounted. */
+  start(): void {
+    void this.#run();
+  }
+
+  async #run(): Promise<void> {
+    this.#phase = "streaming";
+    this.#text = "";
+    this.#message = "";
+    this.#frame = 0;
+    const controller = new AbortController();
+    this.#controller = controller;
+    const timer = setInterval(() => {
+      this.#frame = (this.#frame + 1) % FRAMES.length;
+      this.#deps.requestRender();
+    }, 120);
+    try {
+      const text = await this.#deps.run((partial) => {
+        this.#text = partial;
+        this.#deps.requestRender();
+      }, controller.signal);
+      this.#text = text;
+      this.#phase = "done";
+    } catch (err) {
+      if (controller.signal.aborted) {
+        // The draft was never touched; closing the view is the whole revert.
+        this.#deps.done(undefined);
+        return;
+      }
+      this.#message = err instanceof Error ? err.message : String(err);
+      this.#phase = "error";
+    } finally {
+      clearInterval(timer);
+      this.#controller = null;
+      this.#deps.requestRender();
+    }
+  }
+
+  handleInput(data: string): void {
+    if (this.#phase === "streaming") {
+      if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
+        this.#controller?.abort();
+      }
+      return;
+    }
+    if (this.#phase === "error") {
+      if (matchesKey(data, "escape") || matchesKey(data, "enter") || matchesKey(data, "ctrl+c")) {
+        this.#deps.done(undefined);
+      }
+      return;
+    }
+    if (matchesKey(data, "ctrl+c")) {
+      this.#deps.done(undefined);
+      return;
+    }
+    if (matchesKey(data, "escape")) {
+      this.#deps.done(undefined);
+      return;
+    }
+    if (matchesKey(data, "enter")) {
+      this.#deps.done({ kind: "accept", text: this.#text });
+      return;
+    }
+    if (data === "r" || data === "R") {
+      void this.#run();
+      return;
+    }
+    if (data === "e" || data === "E") {
+      this.#deps.done({ kind: "edit", text: this.#text });
+    }
+  }
+
+  render(width: number): string[] {
+    const w = Math.max(20, width);
+    const spinner = FRAMES[this.#frame];
+    const head =
+      this.#phase === "streaming"
+        ? `${spinner} 优化中（via ${this.#deps.label}）`
+        : this.#phase === "error"
+          ? `✗ 优化失败`
+          : `✓ 已生成（via ${this.#deps.label}）`;
+    const footer =
+      this.#phase === "streaming"
+        ? "Esc / Ctrl+C 取消"
+        : this.#phase === "error"
+          ? `${this.#message} — Enter / Esc 关闭`
+          : "Enter 接受 · r 再生成 · e 编辑 · Esc 回退原文";
+
+    const body =
+      this.#phase === "streaming" && !this.#text
+        ? ["（等待模型输出…）"]
+        : wrapTextWithAnsi(this.#text, Math.max(10, w - 2)).map((line) => ` ${line}`);
+
+    return [
+      truncateToWidth(head, w),
+      "─".repeat(w),
+      ...body.slice(-BODY_LINES),
+      "─".repeat(w),
+      truncateToWidth(footer, w),
+    ];
+  }
+
+  invalidate(): void {
+    // No cached layout.
+  }
+
+  dispose(): void {
+    if (this.#disposed) return;
+    this.#disposed = true;
+    this.#controller?.abort();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Extension entry
 // ---------------------------------------------------------------------------
 
@@ -157,9 +296,10 @@ interface CommandCtx {
     getEditorText?: () => string;
     setEditorText?: (text: string) => void;
     notify: (message: string, kind?: "info" | "warning" | "error") => void;
-    setWidget?: (key: string, lines: string[] | undefined, opts?: { placement?: "aboveEditor" | "belowEditor" }) => void;
     onTerminalInput?: (handler: (data: string) => { consume: boolean } | undefined) => () => void;
-    select?: (title: string, options: string[]) => Promise<string | undefined>;
+    custom?: <T>(
+      factory: (tui: { requestRender: () => void }, theme: unknown, keybindings: unknown, done: (value: T) => void) => Component,
+    ) => Promise<T>;
   };
 }
 
@@ -220,75 +360,25 @@ export default function promptOptimizer(pi: ExtensionAPI): void {
     const contextBlock = turns ? `\n\n<recent-conversation>\n${turns}\n</recent-conversation>` : "";
     const original = draft;
 
-    // Preview widget: read-only tail of the streamed text. The editor is never
-    // touched here, so Esc or "回退原文" leaves the draft exactly as it was.
-    let preview = "";
-    let frame = 0;
-    const showPreview = (status: string) => {
-      ctx.ui.setWidget?.(WIDGET, [status, ...preview.split("\n").slice(-PREVIEW_LINES)], {
-        placement: "aboveEditor",
-      });
-    };
-
-    try {
-      for (;;) {
-        const controller = new AbortController();
-        const removeKeys = ctx.ui.onTerminalInput?.((data) => {
-          if (data === "\x1b") {
-            controller.abort();
-            return { consume: true };
-          }
-          return undefined;
-        });
-        const streaming = () => `${FRAMES[frame]} 优化中（via ${modelLabel}）· Esc 取消`;
-        preview = "";
-        frame = 0;
-        showPreview(streaming());
-        const timer = setInterval(() => {
-          frame = (frame + 1) % FRAMES.length;
-          showPreview(streaming());
-        }, 150);
-
-        let optimized: string;
-        try {
-          optimized = await generate(original, contextBlock, model, apiKey, controller.signal, (text) => {
-            preview = text;
-            showPreview(streaming());
-          });
-        } catch (err) {
-          if (controller.signal.aborted) {
-            ctx.ui.notify("已取消优化", "info");
-          } else {
-            ctx.ui.notify(`优化失败：${err instanceof Error ? err.message : String(err)}`, "error");
-          }
-          return;
-        } finally {
-          clearInterval(timer);
-          removeKeys?.();
-        }
-
-        preview = optimized;
-        showPreview(`✓ 已生成（via ${modelLabel}）· 输入框保持原文`);
-
-        const choice = await ctx.ui.select?.("优化结果", ["接受", "再生成", "编辑", "回退原文"]);
-        if (choice === "接受") {
-          ctx.ui.setEditorText?.(optimized);
-          return;
-        }
-        if (choice === "编辑") {
-          ctx.ui.setEditorText?.(optimized);
-          ctx.ui.notify("已写入输入框，可编辑后发送", "info");
-          return;
-        }
-        if (choice === "再生成") continue;
-
-        // "回退原文" / dismissed dialog: the editor was never touched, so leave it.
-        ctx.ui.notify(choice === "回退原文" ? "已保留原文" : "未做选择，输入框保持原样", "info");
-        return;
-      }
-    } finally {
-      ctx.ui.setWidget?.(WIDGET, undefined);
+    if (!ctx.ui.custom) {
+      ctx.ui.notify("/optimize 需要交互式界面（custom UI 不可用）", "error");
+      return;
     }
+
+    const outcome = await ctx.ui.custom<Outcome>((tui, _theme, _keybindings, done) => {
+      const view = new OptimizerView({
+        label: modelLabel,
+        requestRender: () => tui.requestRender(),
+        done,
+        run: (onText, signal) => generate(original, contextBlock, model, apiKey, signal, onText),
+      });
+      view.start();
+      return view;
+    });
+
+    if (outcome === undefined) return;
+    ctx.ui.setEditorText?.(outcome.text);
+    if (outcome.kind === "edit") ctx.ui.notify("已写入输入框，可编辑后发送", "info");
   };
 
   const optimizeOnce = async (ctx: CommandCtx, argText: string, fromShortcut: boolean): Promise<void> => {
