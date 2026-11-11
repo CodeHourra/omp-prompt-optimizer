@@ -5,7 +5,7 @@
   "license": "MIT",
   "omp": {
     "extensions": [
-      "./extensions/prompt-optimizer.ts"
+      "./extensions/prompt-optimizer/index.ts"
     ]
   }
 }
