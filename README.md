@@ -4,7 +4,19 @@ Oh My Pi (omp) 扩展：`/optimize` 用 LLM 优化输入框里的提示词。
 
 ## 安装
 
+**方式一：marketplace（推荐）**
+
+```
+/marketplace add CodeHourra/omp-prompt-optimizer
+/marketplace install prompt-optimizer@omp-prompt-optimizer
+```
+
+安装后执行 `/reload-plugins` 或重启 omp。
+
+**方式二：单文件**
+
 把 `extensions/prompt-optimizer.ts` 复制到 `~/.omp/agent/extensions/`，重启 omp。
+两种方式只保留一种，同时安装会重复注册 `/optimize`。
 
 ## 用法
 
