@@ -1,0 +1,9 @@
+{
+  "name": "omp-prompt-optimizer",
+  "version": "0.1.0",
+  "description": "omp extension: /optimize rewrites the editor prompt with an LLM, streaming into the input box.",
+  "license": "MIT",
+  "omp": {
+    "extensions": ["./extensions/prompt-optimizer.ts"]
+  }
+}

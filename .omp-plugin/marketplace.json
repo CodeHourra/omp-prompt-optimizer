@@ -1,0 +1,15 @@
+{
+  "name": "omp-prompt-optimizer",
+  "owner": { "name": "CodeHourra" },
+  "metadata": { "description": "omp prompt optimizer extension", "version": "0.1.0" },
+  "plugins": [
+    {
+      "name": "prompt-optimizer",
+      "description": "/optimize: LLM-rewrite the editor prompt, streaming into the input box",
+      "source": "./",
+      "version": "0.1.0",
+      "category": "productivity",
+      "homepage": "https://github.com/CodeHourra/omp-prompt-optimizer"
+    }
+  ]
+}
