@@ -1,20 +1,41 @@
 // prompt-optimizer extension for OMP (Oh My Pi).
 //
-// /optimize — rewrite the current editor draft with an LLM in a full-screen
-// custom view. The draft is never touched until you accept the result.
+// /optimize — rewrite the current editor draft with an LLM in an overlay
+// panel. The draft is never touched until you accept the result.
 //
 // Design contract:
 //   - Trigger: /optimize slash command, or Option+O in the editor.
 //   - Optimizer model: @smol role via ctx.models.resolve (zero plugin config).
 //   - Context: last 3 conversation turns appended to the optimization request.
-//   - Keys while streaming: Esc / Ctrl+C aborts the request.
-//   - Keys when done: Enter accept, r regenerate, e edit, Esc keep original.
+//   - View: host OverlayPanel + Markdown in a ScrollView; describe() gives Tern
+//     a native sheet instead of the row fallback.
+//   - Keys while streaming: interrupt key (Esc) / Ctrl+C aborts the request.
+//   - Keys when done: Enter accept, r regenerate, e edit, ↑↓/PgUp/PgDn/Home/End
+//     scroll, interrupt key keeps the original.
 //   - Result: written to the editor only on accept / edit; never auto-sent.
 //   - State: in-memory only. No history, no persistence.
 //   - Fail fast: empty editor / no model / no auth / busy -> notify and exit.
 
-import type { Component } from "@oh-my-pi/pi-tui";
-import { matchesKey, truncateToWidth, wrapTextWithAnsi } from "@oh-my-pi/pi-tui";
+import {
+  col,
+  type Component,
+  getMarkdownTheme,
+  Markdown,
+  matchesKey,
+  md,
+  type NativeNode,
+  node,
+  ScrollView,
+  span,
+  Text,
+  text,
+  theme,
+  type TUI,
+} from "@oh-my-pi/pi-tui";
+import { formatKeyHint } from "@oh-my-pi/pi-tui/app-keybindings";
+import { boundKeys, interruptKey, OverlayPanel, PanelDivider } from "@oh-my-pi/pi-tui/chrome";
+import { matchesAppInterrupt } from "@oh-my-pi/pi-tui/keybinding-matchers";
+import { hintsRow, type NativeHint } from "@oh-my-pi/pi-tui/native/overlay";
 import { streamSimple } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
@@ -144,12 +165,16 @@ type Outcome = { kind: "accept" | "edit"; text: string } | undefined;
 
 interface ViewDeps {
   label: string;
-  requestRender: () => void;
+  tui: TUI;
   done: (outcome: Outcome) => void;
   run: (onText: (text: string) => void, signal: AbortSignal) => Promise<string>;
 }
 
-class OptimizerView implements Component {
+const ROLE = "omp.overlay.prompt-optimizer";
+
+class OptimizerView extends OverlayPanel {
+  // Tern draws an `omp.overlay.*` overlay as a glass sheet, so describe() must not add its own frame.
+  readonly nativeOverlay = { role: ROLE };
   #deps: ViewDeps;
   #phase: "streaming" | "done" | "error" = "streaming";
   #text = "";
@@ -157,9 +182,19 @@ class OptimizerView implements Component {
   #frame = 0;
   #controller: AbortController | null = null;
   #disposed = false;
+  #native: NativeNode | undefined;
+  readonly #markdown = new Markdown("", 0, 0, getMarkdownTheme());
+  readonly #notice = new Text("", 0, 0);
+  readonly #scroll = new ScrollView(this.#notice, { height: 1, followTail: true });
+  readonly #footer = new Text("", 0, 0);
 
   constructor(deps: ViewDeps) {
+    super("", ROLE);
     this.#deps = deps;
+    this.addChild(this.#scroll);
+    this.addChild(new PanelDivider());
+    this.addChild(this.#footer);
+    this.#sync();
   }
 
   /** Kick off the first generation. Call after the view is mounted. */
@@ -172,16 +207,18 @@ class OptimizerView implements Component {
     this.#text = "";
     this.#message = "";
     this.#frame = 0;
+    this.#sync();
     const controller = new AbortController();
     this.#controller = controller;
     const timer = setInterval(() => {
       this.#frame = (this.#frame + 1) % FRAMES.length;
-      this.#deps.requestRender();
+      this.#syncTitle();
+      this.#deps.tui.requestRender();
     }, 120);
     try {
       const text = await this.#deps.run((partial) => {
         this.#text = partial;
-        this.#deps.requestRender();
+        this.#sync();
       }, controller.signal);
       this.#text = text;
       this.#phase = "done";
@@ -196,28 +233,65 @@ class OptimizerView implements Component {
     } finally {
       clearInterval(timer);
       this.#controller = null;
-      this.#deps.requestRender();
+      this.#sync();
     }
   }
 
+  /** Push the phase and text into the child components, drop the native memo, repaint. */
+  #sync(): void {
+    this.#syncTitle();
+    if (this.#phase === "error") {
+      this.#notice.setText(theme.fg("error", this.#message));
+      this.#scroll.setChild(this.#notice);
+    } else if (this.#text) {
+      this.#markdown.setText(this.#text);
+      this.#scroll.setChild(this.#markdown);
+    } else {
+      this.#notice.setText(theme.fg("dim", `${theme.status.pending} 等待模型输出…`));
+      this.#scroll.setChild(this.#notice);
+    }
+    this.#scroll.setFollowTail(this.#phase === "streaming");
+    this.#footer.setText(this.#footerLine());
+    this.#native = undefined;
+    this.#deps.tui.requestRender();
+  }
+
+  #syncTitle(): void {
+    const status =
+      this.#phase === "streaming"
+        ? `${FRAMES[this.#frame]} 优化中`
+        : this.#phase === "error"
+          ? `${theme.status.error} 优化失败`
+          : `${theme.status.success} 已生成`;
+    this.title = `${status} · ${this.#deps.label}`;
+  }
+
+  #footerLine(): string {
+    const esc = interruptKey();
+    if (this.#phase === "streaming") return theme.fg("muted", `${esc} 取消 · ↑↓ 滚动`);
+    if (this.#phase === "error") return theme.fg("muted", `${esc} / ${formatKeyHint("enter")} 关闭`);
+    const actions = [
+      `${formatKeyHint("enter")} 接受`,
+      `${formatKeyHint("r")} 再生成`,
+      `${formatKeyHint("e")} 编辑`,
+      "↑↓ 滚动",
+      `${esc} 保留原文`,
+    ];
+    return theme.fg("muted", actions.join(" · "));
+  }
+
   handleInput(data: string): void {
+    const interrupt = matchesAppInterrupt(data) || matchesKey(data, "ctrl+c");
     if (this.#phase === "streaming") {
-      if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
-        this.#controller?.abort();
-      }
+      if (interrupt) this.#controller?.abort();
+      else if (this.#scroll.handleScrollKey(data)) this.#deps.tui.requestRender();
       return;
     }
     if (this.#phase === "error") {
-      if (matchesKey(data, "escape") || matchesKey(data, "enter") || matchesKey(data, "ctrl+c")) {
-        this.#deps.done(undefined);
-      }
+      if (interrupt || matchesKey(data, "enter")) this.#deps.done(undefined);
       return;
     }
-    if (matchesKey(data, "ctrl+c")) {
-      this.#deps.done(undefined);
-      return;
-    }
-    if (matchesKey(data, "escape")) {
+    if (interrupt) {
       this.#deps.done(undefined);
       return;
     }
@@ -231,60 +305,62 @@ class OptimizerView implements Component {
     }
     if (data === "e" || data === "E") {
       this.#deps.done({ kind: "edit", text: this.#text });
+      return;
     }
+    if (this.#scroll.handleScrollKey(data)) this.#deps.tui.requestRender();
   }
 
-  render(width: number): string[] {
-    // `width` is already the paint area the host reserved for this component;
-    // `rows` bounds how many lines can be shown before the view is clipped.
-    const w = Math.max(20, width);
-    const rows = process.stdout.rows ?? 40;
-    const spinner = FRAMES[this.#frame];
-    const head =
-      this.#phase === "streaming"
-        ? `${spinner} 优化中（via ${this.#deps.label}）`
-        : this.#phase === "error"
-          ? `✗ 优化失败`
-          : `✓ 已生成（via ${this.#deps.label}）`;
-    const footer =
-      this.#phase === "streaming"
-        ? "Esc / Ctrl+C 取消"
-        : this.#phase === "error"
-          ? `${this.#message} — Enter / Esc 关闭`
-          : "Enter 接受 · r 再生成 · e 编辑 · Esc 回退原文";
+  override render(width: number): readonly string[] {
+    // The overlay is clipped at the terminal height, so size the viewport to
+    // what fits around the panel chrome: two borders, the divider, the footer.
+    const inner = Math.max(1, width - 4);
+    const body = this.#phase !== "error" && this.#text ? this.#markdown : this.#notice;
+    const cap = Math.max(3, this.#deps.tui.terminal.rows - 3 - this.#footer.render(inner).length);
+    this.#scroll.setHeight(Math.max(1, Math.min(body.render(inner).length, cap)));
+    return super.render(width);
+  }
 
-    // Wrap to the full width and do not add our own indent: the host already
-    // pads the component, and any extra column pushes the last glyph off.
-    const wrapped =
-      this.#phase === "streaming" && !this.#text
-        ? ["（等待模型输出…）"]
-        : wrapTextWithAnsi(this.#text, w);
-
-    // Reserve room for the header, both rules, the footer, and a chrome row.
-    const chrome = this.#phase === "streaming" || this.#phase === "error" ? 5 : 4;
-    const capacity = Math.max(3, rows - chrome);
-    // When clipped, the notice takes one row and the newest lines fill the rest.
-    const shown = wrapped.length > capacity ? wrapped.slice(-(capacity - 1)) : wrapped;
+  override describe(): NativeNode {
+    if (this.#native) return this.#native;
+    const live = this.#phase === "streaming";
+    const head = node("row", { role: "omp.sheet.head", gap: "sm", align: "center" }, [
+      ...(live ? [node("spinner", {})] : []),
+      text([span("/optimize", "accent"), span(` · ${this.#deps.label}`, "muted")], { truncate: "end", lines: 1 }),
+    ]);
     const body =
-      shown.length < wrapped.length ? [`… 上方 ${wrapped.length - shown.length} 行未显示`, ...shown] : shown;
-
-    return [
-      truncateToWidth(head, w),
-      "─".repeat(w),
-      ...body,
-      "─".repeat(w),
-      truncateToWidth(footer, w),
-    ];
+      this.#phase === "error"
+        ? text([span(this.#message, "error")], { wrap: "word" })
+        : this.#text
+          ? md(this.#text, { stream: live })
+          : text([span(`${theme.status.pending} 等待模型输出…`, "dim")]);
+    const esc = boundKeys("app.interrupt", ["escape"]).slice(0, 1);
+    const hints: NativeHint[] = live
+      ? [{ keys: esc, label: "取消" }]
+      : this.#phase === "error"
+        ? [{ keys: esc, label: "关闭" }]
+        : [
+            { keys: ["enter"], label: "接受" },
+            { keys: ["r"], label: "再生成" },
+            { keys: ["e"], label: "编辑" },
+            { keys: esc, label: "保留原文" },
+          ];
+    this.#native = col([head, body, hintsRow(hints)], {
+      gap: "sm",
+      tone: this.#phase === "error" ? "error" : undefined,
+    });
+    return this.#native;
   }
 
-  invalidate(): void {
-    // No cached layout.
+  override invalidate(): void {
+    this.#native = undefined;
+    super.invalidate();
   }
 
-  dispose(): void {
+  override dispose(): void {
     if (this.#disposed) return;
     this.#disposed = true;
     this.#controller?.abort();
+    super.dispose();
   }
 }
 
@@ -309,7 +385,8 @@ interface CommandCtx {
     notify: (message: string, kind?: "info" | "warning" | "error") => void;
     onTerminalInput?: (handler: (data: string) => { consume: boolean } | undefined) => () => void;
     custom?: <T>(
-      factory: (tui: { requestRender: () => void }, theme: unknown, keybindings: unknown, done: (value: T) => void) => Component,
+      factory: (tui: TUI, theme: unknown, keybindings: unknown, done: (value: T) => void) => Component,
+      options?: { overlay?: boolean },
     ) => Promise<T>;
   };
 }
@@ -379,13 +456,13 @@ export default function promptOptimizer(pi: ExtensionAPI): void {
     const outcome = await ctx.ui.custom<Outcome>((tui, _theme, _keybindings, done) => {
       const view = new OptimizerView({
         label: modelLabel,
-        requestRender: () => tui.requestRender(),
+        tui,
         done,
         run: (onText, signal) => generate(original, contextBlock, model, apiKey, signal, onText),
       });
       view.start();
       return view;
-    });
+    }, { overlay: true });
 
     // Every non-accept exit puts the draft back: `/optimize <text>` clears the
     // editor before we run, so leaving without a write would lose the prompt.

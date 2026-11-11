@@ -10,7 +10,7 @@
   "plugins": [
     {
       "name": "prompt-optimizer",
-      "description": "/optimize: LLM-rewrite the editor prompt in a full-screen view (Esc cancels, Enter accepts)",
+      "description": "/optimize: LLM-rewrite the editor prompt in an overlay panel (Esc cancels, Enter accepts)",
       "source": "./",
       "version": "0.2.0",
       "category": "productivity",
