@@ -1,6 +1,6 @@
 {
   "name": "omp-prompt-optimizer",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "omp extension: /optimize rewrites the editor prompt with an LLM in an overlay panel.",
   "license": "MIT",
   "omp": {

@@ -369,7 +369,7 @@ class OptimizerView extends OverlayPanel {
   }
 
   override dispose(): void {
-    if (this.#timer) clearInterval(this.#timer);
+    clearInterval(this.#timer);
     this.#timer = undefined;
     this.#session.cancel();
     this.#session.onChange = undefined;

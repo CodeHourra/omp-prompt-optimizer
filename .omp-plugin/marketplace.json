@@ -5,14 +5,14 @@
   },
   "metadata": {
     "description": "omp prompt optimizer extension",
-    "version": "0.2.0"
+    "version": "0.3.0"
   },
   "plugins": [
     {
       "name": "prompt-optimizer",
       "description": "/optimize: LLM-rewrite the editor prompt in an overlay panel (Esc cancels, Enter accepts)",
       "source": "./",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "category": "productivity",
       "homepage": "https://github.com/CodeHourra/omp-prompt-optimizer"
     }
