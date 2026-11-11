@@ -9,8 +9,7 @@
 //   - Optimizer model: @smol role via ctx.models.resolve (zero plugin config).
 //   - Context: last 3 conversation turns appended to the optimization request.
 //   - Progress: working message while generating; Esc cancels the request.
-//   - Result UI: native ctx.ui.editor dialog; Submit accepts, Cancel discards.
-//   - Accept writes the result back to the editor; it is never auto-sent.
+//   - Result: written back to the input box after generation; never auto-sent.
 //   - State: in-memory only. No history, no persistence.
 //   - Fail fast: empty editor / no model / no auth / busy -> notify and exit.
 
@@ -147,9 +146,8 @@ interface CommandCtx {
     getEditorText?: () => string;
     setEditorText?: (text: string) => void;
     notify: (message: string, kind?: "info" | "warning" | "error") => void;
-    setWorkingMessage?: (message?: string) => void;
+    setWidget?: (key: string, lines: string[] | undefined, opts?: { placement?: "aboveEditor" | "belowEditor" }) => void;
     onTerminalInput?: (handler: (data: string) => { consume: boolean } | undefined) => () => void;
-    editor?: (title: string, prefill?: string) => Promise<string | undefined>;
   };
 }
 
@@ -176,15 +174,23 @@ export default function promptOptimizer(pi: ExtensionAPI): void {
       }
       return undefined;
     });
-    const label0 = `优化中（via ${label}），Esc 取消…`;
-    ctx.ui.notify(label0, "info");
-    ctx.ui.setWorkingMessage?.(label0);
-    const preview = (text: string) => {
-      const tail = text.replace(/\s+/g, " ").trim().slice(-120);
-      ctx.ui.setWorkingMessage?.(tail ? `${label0} ${tail}` : label0);
+    const WIDGET = "prompt-optimizer";
+    const FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let frame = 0;
+    const render = () => {
+      ctx.ui.setWidget?.(WIDGET, [`${FRAMES[frame]} 优化中（via ${label}）· Esc 取消`], { placement: "aboveEditor" });
+    };
+    render();
+    const timer = setInterval(() => {
+      frame = (frame + 1) % FRAMES.length;
+      render();
+    }, 150);
+    // Each delta rewrites the input box with the text generated so far.
+    const stream = (text: string) => {
+      ctx.ui.setEditorText?.(text);
     };
     try {
-      return await generate(original, contextBlock, model, apiKey, controller.signal, preview);
+      return await generate(original, contextBlock, model, apiKey, controller.signal, stream);
     } catch (err) {
       if (!controller.signal.aborted) {
         ctx.ui.notify(`优化失败：${err instanceof Error ? err.message : String(err)}`, "error");
@@ -193,8 +199,9 @@ export default function promptOptimizer(pi: ExtensionAPI): void {
       }
       return undefined;
     } finally {
+      clearInterval(timer);
       removeKeys?.();
-      ctx.ui.setWorkingMessage?.();
+      ctx.ui.setWidget?.(WIDGET, undefined);
     }
   };
 
@@ -204,10 +211,6 @@ export default function promptOptimizer(pi: ExtensionAPI): void {
   // command, which needs an empty editor).
   const optimizeOnce = async (ctx: CommandCtx, argText: string, fromShortcut: boolean): Promise<void> => {
     if (!ctx.hasUI) return;
-    if (!ctx.ui.editor) {
-      ctx.ui.notify("/optimize 需要交互式界面（原生对话框不可用）", "error");
-      return;
-    }
 
     const draft = argText || (ctx.ui.getEditorText?.() ?? "").trim();
     if (!draft) {
@@ -258,10 +261,8 @@ export default function promptOptimizer(pi: ExtensionAPI): void {
     const optimized = await generateWithProgress(ctx, modelLabel, original, contextBlock, model, apiKey);
     if (optimized === undefined) return;
 
-    // Result page: the optimized text itself is the dialog. Submit accepts and
-    // writes it back to the editor (no auto-send); Cancel discards it.
-    const accepted = await ctx.ui.editor(`优化完成（via ${modelLabel}）：Submit 采纳，Cancel 放弃`, optimized);
-    if (accepted?.trim()) ctx.ui.setEditorText?.(accepted.trim());
+    // Echo the result into the input box; the user reviews, edits, and sends.
+    ctx.ui.setEditorText?.(optimized.trim());
   };
 
   pi.registerCommand("optimize", {
